@@ -1,0 +1,47 @@
+# Define path to the JSON file and output directory
+$jsonFilePath = "C:\path\to\your\output.json"
+$outputBaseDir = "C:\path\to\your\output"
+
+# Read and parse the JSON file
+$fileData = Get-Content -Path $jsonFilePath -Raw | ConvertFrom-Json
+
+# Group data by ServerName
+$serverGroups = $fileData | Group-Object -Property ServerName
+
+# Process each server
+foreach ($serverGroup in $serverGroups) {
+    $serverName = $serverGroup.Name
+    Write-Host "Processing files from server: $serverName" -ForegroundColor Green
+    
+    # Create output directory for this server if it doesn't exist
+    $serverOutputDir = Join-Path -Path $outputBaseDir -ChildPath $serverName
+    if (!(Test-Path -Path $serverOutputDir)) {
+        New-Item -Path $serverOutputDir -ItemType Directory -Force | Out-Null
+        Write-Host "Created directory: $serverOutputDir" -ForegroundColor Yellow
+    }
+    
+    # Process each file for this server
+    foreach ($fileInfo in $serverGroup.Group) {
+        $filePath = $fileInfo.FilePath
+        $fileName = $fileInfo.FileName
+        
+        # Define the destination path
+        $destinationPath = Join-Path -Path $serverOutputDir -ChildPath $fileName
+        
+        # Create a UNC path to the file on the remote server
+        $uncPath = "\\$serverName\$($filePath -replace ':', '$')"
+        
+        Write-Host "Copying $uncPath to $destinationPath" -ForegroundColor Cyan
+        
+        try {
+            # Copy the file
+            Copy-Item -Path $uncPath -Destination $destinationPath -Force -ErrorAction Stop
+            Write-Host "Successfully copied: $fileName" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "Failed to copy $fileName from $serverName. Error: $_" -ForegroundColor Red
+        }
+    }
+}
+
+Write-Host "File copy process completed" -ForegroundColor Green
