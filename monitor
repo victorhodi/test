@@ -1,0 +1,88 @@
+# Monitor-Results.ps1 - Run on server to monitor deployment results
+param(
+    [string]$ResultsPath = "C:\DeploymentShare\Results",
+    [int]$Hours = 24,
+    [switch]$ShowDetails
+)
+
+Write-Host "Deployment Results Monitor" -ForegroundColor Green
+Write-Host "=" * 50
+
+# Check if results directory exists
+if (-not (Test-Path $ResultsPath)) {
+    Write-Host "Results directory not found: $ResultsPath" -ForegroundColor Red
+    return
+}
+
+# Get recent results based on time filter
+$cutoffTime = (Get-Date).AddHours(-$Hours)
+$recentResults = Get-ChildItem -Path $ResultsPath -Filter "Results_*.7z" -ErrorAction SilentlyContinue | Where-Object { $_.CreationTime -gt $cutoffTime }
+
+if ($recentResults.Count -eq 0) {
+    Write-Host "No deployment results found in the last $Hours hours" -ForegroundColor Yellow
+    return
+}
+
+Write-Host "Recent deployment results (last $Hours hours):"
+Write-Host ""
+
+# Process and display results
+$totalSize = 0
+$uniqueHosts = @{}
+
+$recentResults | Sort-Object CreationTime -Descending | ForEach-Object {
+    # Parse filename: Results_HOSTNAME_YYYYMMDD_HHMMSS.7z
+    $nameParts = $_.BaseName -split '_'
+    if ($nameParts.Length -ge 3) {
+        $hostname = $nameParts[1]
+        $dateTime = $nameParts[2] + "_" + $nameParts[3]
+        
+        # Format datetime for display
+        try {
+            $parsedDate = [DateTime]::ParseExact($dateTime, "yyyyMMdd_HHmmss", $null)
+            $formattedDate = $parsedDate.ToString("yyyy-MM-dd HH:mm:ss")
+        }
+        catch {
+            $formattedDate = $dateTime
+        }
+    }
+    else {
+        $hostname = "Unknown"
+        $formattedDate = $_.CreationTime.ToString("yyyy-MM-dd HH:mm:ss")
+    }
+    
+    $sizeKB = [math]::Round($_.Length / 1KB, 2)
+    $totalSize += $_.Length
+    $uniqueHosts[$hostname] = $true
+    
+    Write-Host "Computer: $hostname" -ForegroundColor Cyan
+    Write-Host "  Timestamp: $formattedDate"
+    Write-Host "  File Size: $sizeKB KB"
+    Write-Host "  File Name: $($_.Name)"
+    
+    if ($ShowDetails) {
+        Write-Host "  Full Path: $($_.FullName)"
+        Write-Host "  Created: $($_.CreationTime)"
+        Write-Host "  Modified: $($_.LastWriteTime)"
+    }
+    
+    Write-Host ""
+}
+
+# Summary statistics
+$totalSizeMB = [math]::Round($totalSize / 1MB, 2)
+Write-Host "Summary:" -ForegroundColor Green
+Write-Host "  Total Results: $($recentResults.Count)"
+Write-Host "  Unique Computers: $($uniqueHosts.Count)"
+Write-Host "  Total Size: $totalSizeMB MB"
+Write-Host "  Time Range: Last $Hours hours"
+
+# Additional statistics if requested
+if ($ShowDetails) {
+    Write-Host ""
+    Write-Host "Deployment Timeline:" -ForegroundColor Yellow
+    $recentResults | Sort-Object CreationTime | ForEach-Object {
+        $relativeTime = [math]::Round(((Get-Date) - $_.CreationTime).TotalHours, 1)
+        Write-Host "  $($_.Name) - $relativeTime hours ago"
+    }
+}
