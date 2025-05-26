@@ -1,6 +1,6 @@
 # Server-Setup-Shares.ps1 - Run on server
 param(
-    [string]$ShareBasePath = "C:\DeploymentShare"
+    [string]$ShareBasePath = "F:\DeploymentShare"
 )
 
 # Create directories
