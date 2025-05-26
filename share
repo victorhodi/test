@@ -1,0 +1,26 @@
+# Server-Setup-Shares.ps1 - اجرا روی سرور
+# ایجاد پوشه‌ها
+$PackagePath = "C:\DeploymentShare\Packages"
+$ResultsPath = "C:\DeploymentShare\Results"
+
+New-Item -Path $PackagePath -ItemType Directory -Force
+New-Item -Path $ResultsPath -ItemType Directory -Force
+
+# ایجاد Share برای Packages (Read-Only برای کلاینت‌ها)
+New-SmbShare -Name "DeployPackages" -Path $PackagePath -ReadAccess "Domain Computers", "Everyone" -FullAccess "Administrators"
+
+# ایجاد Share برای Results (Write برای کلاینت‌ها، اما فقط برای فایل‌های خودشان)
+New-SmbShare -Name "DeployResults" -Path $ResultsPath -ChangeAccess "Domain Computers", "Everyone" -FullAccess "Administrators"
+
+# تنظیم دسترسی‌های NTFS
+# پوشه Packages: Read برای همه
+icacls $PackagePath /grant "Everyone:(OI)(CI)R" /T
+icacls $PackagePath /grant "Administrators:(OI)(CI)F" /T
+
+# پوشه Results: Create Files/Write Data برای همه، اما نه Delete یا Modify
+icacls $ResultsPath /grant "Everyone:(OI)(CI)(W,AD)" /T
+icacls $ResultsPath /grant "Administrators:(OI)(CI)F" /T
+
+Write-Host "Shares created successfully:"
+Write-Host "Package Share: \\$env:COMPUTERNAME\DeployPackages"
+Write-Host "Results Share: \\$env:COMPUTERNAME\DeployResults"
