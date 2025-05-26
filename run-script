@@ -1,47 +1,539 @@
-# Server-Setup-Shares.ps1 - Run on server
+# Deploy-Application.ps1
 param(
-    [string]$ShareBasePath = "C:\DeploymentShare"
+    [string]$ServerName = "YOUR-SERVER-NAME",
+    [string]$ExecutableName = "thor.exe",
+    [string]$ExecutableArgs = "-t Eventlog -s 1000 --csv --html --json --log",
+    [int]$TimeoutMinutes = 60,
+    [string]$WorkingSubfolder = "THOR"
 )
 
-# Create directories
-$PackagePath = Join-Path $ShareBasePath "Packages"
-$ResultsPath = Join-Path $ShareBasePath "Results"
+# Global variables and initialization
+$ErrorActionPreference = "Continue"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$WorkingDir = Join-Path $env:TEMP ("AppDeploy_" + (Get-Random))
+$Hostname = $env:COMPUTERNAME
+$CurrentDate = Get-Date -Format "yyyyMMdd_HHmmss"
+$LogFile = Join-Path $WorkingDir "deployment.log"
 
-Write-Host "Creating deployment share directories..."
-New-Item -Path $PackagePath -ItemType Directory -Force | Out-Null
-New-Item -Path $ResultsPath -ItemType Directory -Force | Out-Null
+# Configuration settings
+$Config = @{
+    Paths = @{
+        PackageShare = "\\$ServerName\DeployPackages$"
+        ResultsShare = "\\$ServerName\DeployResults$"
+    }
+    Application = @{
+        ExecutableName = $ExecutableName
+        ExecutableArgs = $ExecutableArgs
+        TimeoutMinutes = $TimeoutMinutes
+        WorkingSubfolder = $WorkingSubfolder
+    }
+    OutputFiles = @{
+        Extensions = @("txt", "csv", "html", "json")
+        FileNamePattern = "{0}_{1}" # hostname_date
+    }
+}
 
-# Create hidden share for packages (read-only for clients)
-Write-Host "Creating package share (hidden)..."
-New-SmbShare -Name "DeployPackages$" -Path $PackagePath -ReadAccess "Domain Computers", "Everyone" -FullAccess "Administrators" -Description "Deployment Packages (Hidden)"
+# Logging function
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Level = "Info"
+    )
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logEntry = "[$timestamp] [$Level] $Message"
+    
+    Write-Host $logEntry
+    
+    if (Test-Path $LogFile) {
+        Add-Content -Path $LogFile -Value $logEntry -Encoding UTF8
+    }
+}
 
-# Create hidden share for results (write-only for clients, no read access)
-Write-Host "Creating results share (hidden, write-only)..."
-New-SmbShare -Name "DeployResults$" -Path $ResultsPath -FullAccess "Administrators" -Description "Deployment Results (Hidden)"
+# Create directory if not exists
+function New-DirectoryIfNotExists {
+    param([string]$Path)
+    
+    if (-not (Test-Path $Path)) {
+        try {
+            New-Item -Path $Path -ItemType Directory -Force | Out-Null
+            Write-Log "Created directory: $Path"
+            return $true
+        }
+        catch {
+            Write-Log "Failed to create directory: $Path - $($_.Exception.Message)" -Level "Error"
+            return $false
+        }
+    }
+    return $true
+}
 
-# Set NTFS permissions
-Write-Host "Setting NTFS permissions..."
+# Check if application has completed based on log file
+function Test-ApplicationComplete {
+    param([string]$LogFilePath)
+    
+    if (-not (Test-Path $LogFilePath)) {
+        return $false
+    }
+    
+    try {
+        # Read last 10 lines of log file
+        $content = Get-Content -Path $LogFilePath -Tail 10 -ErrorAction SilentlyContinue
+        
+        foreach ($line in $content) {
+            # Check for THOR completion pattern
+            if ($line -match "THOR.*Scan\s+finished.*END_TIME.*ALERTS.*WARNINGS.*NOTICES.*ERRORS") {
+                Write-Log "Application completion detected in log: $line"
+                return $true
+            }
+        }
+        
+        return $false
+    }
+    catch {
+        Write-Log "Error checking log file: $($_.Exception.Message)" -Level "Warning"
+        return $false
+    }
+}
 
-# Package folder: Read access for everyone
-icacls $PackagePath /inheritance:r
-icacls $PackagePath /grant "Administrators:(OI)(CI)F"
-icacls $PackagePath /grant "Everyone:(OI)(CI)R"
+# Advanced application monitoring with log-based completion detection
+function Wait-ApplicationCompletion {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$LogFilePath,
+        [int]$TimeoutMinutes
+    )
+    
+    $timeoutSeconds = $TimeoutMinutes * 60
+    $startTime = Get-Date
+    $checkInterval = 30 # Check every 30 seconds
+    
+    Write-Log "Starting application monitoring (timeout: $TimeoutMinutes minutes)"
+    
+    while (-not $Process.HasExited -and ((Get-Date) - $startTime).TotalSeconds -lt $timeoutSeconds) {
+        Start-Sleep -Seconds $checkInterval
+        
+        # Check log for completion indicator
+        if (Test-ApplicationComplete -LogFilePath $LogFilePath) {
+            Write-Log "Application reported completion in log file"
+            
+            # Wait for process to fully exit
+            if (-not $Process.HasExited) {
+                Write-Log "Waiting for process to exit gracefully..."
+                $Process.WaitForExit(30000) # Wait additional 30 seconds
+            }
+            break
+        }
+        
+        $elapsed = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+        Write-Log "Application still running... ($elapsed minutes elapsed)"
+    }
+    
+    # Handle timeout or force termination
+    if (-not $Process.HasExited) {
+        Write-Log "Application timeout reached or process stuck, attempting to terminate..." -Level "Warning"
+        try {
+            $Process.Kill()
+            $Process.WaitForExit(10000)
+            Write-Log "Process terminated forcefully"
+        }
+        catch {
+            Write-Log "Failed to terminate process: $($_.Exception.Message)" -Level "Error"
+        }
+    }
+    
+    Write-Log "Application monitoring completed"
+}
 
-# Results folder: Write/Create access only, no read/list access for regular users
-icacls $ResultsPath /inheritance:r
-icacls $ResultsPath /grant "Administrators:(OI)(CI)F"
-icacls $ResultsPath /grant "Everyone:(CI)(W,AD,WD)"
-icacls $ResultsPath /deny "Everyone:(OI)(R,RD,RA)"
+# Cleanup function
+function Cleanup {
+    Write-Log "Starting cleanup process..."
+    
+    try {
+        # Change to temp directory before deletion
+        Set-Location $env:TEMP
+        
+        if (Test-Path $WorkingDir) {
+            # Remove read-only attributes
+            Get-ChildItem -Path $WorkingDir -Recurse -Force | ForEach-Object {
+                if ($_.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
+                    $_.Attributes = $_.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly)
+                }
+            }
+            
+            # Remove working directory
+            Remove-Item -Path $WorkingDir -Recurse -Force
+            Write-Log "Cleanup completed successfully"
+        }
+    }
+    catch {
+        Write-Log "Cleanup failed: $($_.Exception.Message)" -Level "Warning"
+    }
+}
 
-# Set hidden attribute on share folders
-attrib +h $PackagePath
-attrib +h $ResultsPath
+# Test network connectivity to shares
+function Test-ShareConnectivity {
+    param(
+        [string]$PackageShare,
+        [string]$ResultsShare
+    )
+    
+    Write-Log "Testing network connectivity to shares..."
+    
+    # Test package share (read access required)
+    if (-not (Test-Path $PackageShare)) {
+        throw "Cannot access package share: $PackageShare"
+    }
+    Write-Log "Package share accessible: $PackageShare"
+    
+    # Test results share (write access required)
+    try {
+        $testFile = Join-Path $ResultsShare "connectivity_test_$Hostname.tmp"
+        "test" | Out-File -FilePath $testFile -Force
+        Remove-Item -Path $testFile -Force
+        Write-Log "Results share accessible with write permissions: $ResultsShare"
+    }
+    catch {
+        throw "Cannot write to results share: $ResultsShare - $($_.Exception.Message)"
+    }
+}
 
-Write-Host "Share setup completed successfully:"
-Write-Host "Package Share (Hidden): \\$env:COMPUTERNAME\DeployPackages$"
-Write-Host "Results Share (Hidden): \\$env:COMPUTERNAME\DeployResults$"
-Write-Host ""
-Write-Host "Security Notes:"
-Write-Host "- Package share: Read-only access for all users"
-Write-Host "- Results share: Write-only access, no read/list permissions for regular users"
-Write-Host "- Both shares are hidden ($ suffix)"
+# Copy required files from package share
+function Copy-PackageFiles {
+    param(
+        [string]$PackageShare,
+        [string]$DestinationDir
+    )
+    
+    Write-Log "Copying files from package share..."
+    
+    $requiredFiles = @{
+        AppArchive = Join-Path $PackageShare "app.7z"
+        SevenZip = Join-Path $PackageShare "7za.exe"  
+        LicenseFile = Join-Path $PackageShare "licenses\$Hostname.lic"
+    }
+    
+    # Verify all required files exist
+    foreach ($file in $requiredFiles.GetEnumerator()) {
+        if (-not (Test-Path $file.Value)) {
+            throw "$($file.Key) not found: $($file.Value)"
+        }
+    }
+    
+    # Copy files to working directory
+    foreach ($file in $requiredFiles.GetEnumerator()) {
+        $filename = Split-Path $file.Value -Leaf
+        $destination = Join-Path $DestinationDir $filename
+        Copy-Item -Path $file.Value -Destination $destination -Force
+        Write-Log "Copied $($file.Key): $filename"
+    }
+    
+    Write-Log "All required files copied successfully"
+}
+
+# Extract application using 7zip
+function Expand-Application {
+    param(
+        [string]$WorkingDir
+    )
+    
+    Write-Log "Extracting application archive..."
+    
+    $extractPath = Join-Path $WorkingDir "app"
+    $archivePath = Join-Path $WorkingDir "app.7z"
+    $sevenZipPath = Join-Path $WorkingDir "7za.exe"
+    
+    # Prepare 7zip extraction arguments
+    $extractArgs = @("x", "`"$archivePath`"", "-o`"$extractPath`"", "-y")
+    
+    # Execute 7zip extraction
+    $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $processInfo.FileName = $sevenZipPath
+    $processInfo.Arguments = $extractArgs -join " "
+    $processInfo.WorkingDirectory = $WorkingDir
+    $processInfo.UseShellExecute = $false
+    $processInfo.RedirectStandardOutput = $true
+    $processInfo.RedirectStandardError = $true
+    $processInfo.CreateNoWindow = $true
+    
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $processInfo
+    
+    Write-Log "Running extraction: $($processInfo.FileName) $($processInfo.Arguments)"
+    
+    $process.Start() | Out-Null
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+    
+    if ($process.ExitCode -eq 0) {
+        Write-Log "Application extracted successfully"
+        if ($stdout) { Write-Log "7zip output: $stdout" }
+        return $extractPath
+    } else {
+        throw "Extraction failed. Exit code: $($process.ExitCode). Error: $stderr"
+    }
+}
+
+# Install license file to application directory
+function Install-LicenseFile {
+    param(
+        [string]$WorkingDir,
+        [string]$AppPath,
+        [string]$SubFolder
+    )
+    
+    Write-Log "Installing license file..."
+    
+    # Determine target directory for license
+    $licenseTargetDir = $AppPath
+    if ($SubFolder) {
+        $subFolderPath = Join-Path $AppPath $SubFolder
+        if (Test-Path $subFolderPath) {
+            $licenseTargetDir = $subFolderPath
+        }
+    }
+    
+    # Copy license file
+    $sourceLicense = Join-Path $WorkingDir "$Hostname.lic"
+    $targetLicense = Join-Path $licenseTargetDir "$Hostname.lic"
+    
+    Copy-Item -Path $sourceLicense -Destination $targetLicense -Force
+    Write-Log "License installed to: $targetLicense"
+    
+    return $licenseTargetDir
+}
+
+# Execute application and monitor completion
+function Invoke-Application {
+    param(
+        [string]$ExecutablePath,
+        [string]$Arguments,
+        [string]$WorkingDir,
+        [string]$LogFilePath,
+        [int]$TimeoutMinutes
+    )
+    
+    Write-Log "Starting application execution..."
+    Write-Log "Executable: $ExecutablePath"
+    Write-Log "Arguments: $Arguments"
+    Write-Log "Working Directory: $WorkingDir"
+    
+    # Verify executable exists
+    if (-not (Test-Path $ExecutablePath)) {
+        throw "Executable not found: $ExecutablePath"
+    }
+    
+    # Start application process
+    $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $processInfo.FileName = $ExecutablePath
+    $processInfo.Arguments = $Arguments
+    $processInfo.WorkingDirectory = $WorkingDir
+    $processInfo.UseShellExecute = $false
+    $processInfo.RedirectStandardOutput = $false
+    $processInfo.RedirectStandardError = $false
+    $processInfo.CreateNoWindow = $false
+    
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $processInfo
+    
+    # Execute application
+    $process.Start() | Out-Null
+    Write-Log "Application started with PID: $($process.Id)"
+    
+    # Monitor application with log-based completion detection
+    Wait-ApplicationCompletion -Process $process -LogFilePath $LogFilePath -TimeoutMinutes $TimeoutMinutes
+    
+    Write-Log "Application execution completed with exit code: $($process.ExitCode)"
+    return $process.ExitCode
+}
+
+# Collect output files based on expected naming pattern
+function Get-OutputFiles {
+    param(
+        [string]$SearchPath,
+        [string]$FileNameBase,
+        [array]$Extensions
+    )
+    
+    Write-Log "Collecting output files..."
+    
+    $foundFiles = @()
+    
+    # Look for files with expected naming pattern
+    foreach ($ext in $Extensions) {
+        $expectedFile = Join-Path $SearchPath "$FileNameBase.$ext"
+        if (Test-Path $expectedFile) {
+            $foundFiles += $expectedFile
+            Write-Log "Found expected output file: $FileNameBase.$ext"
+        } else {
+            Write-Log "Expected output file not found: $FileNameBase.$ext" -Level "Warning"
+        }
+    }
+    
+    # Also search for any additional log/output files
+    $additionalFiles = Get-ChildItem -Path $SearchPath -Include @("*.log", "*.txt", "*.csv", "*.html", "*.json") -Recurse -ErrorAction SilentlyContinue
+    foreach ($file in $additionalFiles) {
+        if ($foundFiles -notcontains $file.FullName) {
+            $foundFiles += $file.FullName
+            Write-Log "Found additional output file: $($file.Name)"
+        }
+    }
+    
+    Write-Log "Total output files found: $($foundFiles.Count)"
+    return $foundFiles
+}
+
+# Create results archive and upload to results share
+function Publish-Results {
+    param(
+        [array]$OutputFiles,
+        [string]$WorkingDir,
+        [string]$ResultsShare,
+        [string]$ArchiveName
+    )
+    
+    Write-Log "Creating and publishing results archive..."
+    
+    if ($OutputFiles.Count -eq 0) {
+        throw "No output files to archive"
+    }
+    
+    $local7zip = Join-Path $WorkingDir "7za.exe"
+    $localArchive = Join-Path $WorkingDir $ArchiveName
+    
+    # Add deployment log to results
+    $allFiles = $OutputFiles + @($LogFile)
+    
+    # Create archive with 7zip
+    $compressArgs = @("a", "`"$localArchive`"")
+    foreach ($file in $allFiles) {
+        if (Test-Path $file) {
+            $compressArgs += "`"$file`""
+        }
+    }
+    
+    $compressProcessInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $compressProcessInfo.FileName = $local7zip
+    $compressProcessInfo.Arguments = $compressArgs -join " "
+    $compressProcessInfo.WorkingDirectory = $WorkingDir
+    $compressProcessInfo.UseShellExecute = $false
+    $compressProcessInfo.RedirectStandardOutput = $true
+    $compressProcessInfo.RedirectStandardError = $true
+    $compressProcessInfo.CreateNoWindow = $true
+    
+    $compressProcess = New-Object System.Diagnostics.Process
+    $compressProcess.StartInfo = $compressProcessInfo
+    
+    Write-Log "Creating archive: $ArchiveName"
+    
+    $compressProcess.Start() | Out-Null
+    $compressStdout = $compressProcess.StandardOutput.ReadToEnd()
+    $compressStderr = $compressProcess.StandardError.ReadToEnd()
+    $compressProcess.WaitForExit()
+    
+    if ($compressProcess.ExitCode -ne 0) {
+        throw "Failed to create archive. Exit code: $($compressProcess.ExitCode). Error: $compressStderr"
+    }
+    
+    Write-Log "Archive created successfully"
+    
+    # Upload to results share
+    $remoteDestination = Join-Path $ResultsShare $ArchiveName
+    
+    try {
+        Copy-Item -Path $localArchive -Destination $remoteDestination -Force
+        Write-Log "Results uploaded to: $remoteDestination"
+        
+        # Verify upload
+        if (Test-Path $remoteDestination) {
+            $uploadedSize = (Get-Item $remoteDestination).Length
+            $originalSize = (Get-Item $localArchive).Length
+            
+            if ($uploadedSize -eq $originalSize) {
+                Write-Log "Upload verification successful (Size: $uploadedSize bytes)"
+            } else {
+                Write-Log "Upload verification failed - size mismatch" -Level "Warning"
+            }
+        }
+    }
+    catch {
+        # Fallback: save to local accessible location
+        $fallbackPath = Join-Path $env:PUBLIC "Desktop\$ArchiveName"
+        Copy-Item -Path $localArchive -Destination $fallbackPath -Force
+        Write-Log "Upload to share failed, saved locally: $fallbackPath" -Level "Warning"
+        throw "Failed to upload to results share: $($_.Exception.Message)"
+    }
+}
+
+# Main execution function
+function Main {
+    try {
+        Write-Log "=== Starting Application Deployment ==="
+        Write-Log "Target Computer: $Hostname"
+        Write-Log "Current Date/Time: $CurrentDate"
+        Write-Log "Server: $($Config.Paths.PackageShare)"
+        
+        # Initialize working environment
+        if (-not (New-DirectoryIfNotExists -Path $WorkingDir)) {
+            throw "Failed to create working directory"
+        }
+        
+        New-Item -Path $LogFile -ItemType File -Force | Out-Null
+        Write-Log "Working Directory: $WorkingDir"
+        
+        # Test network connectivity
+        Test-ShareConnectivity -PackageShare $Config.Paths.PackageShare -ResultsShare $Config.Paths.ResultsShare
+        
+        # Copy required files from package share
+        Copy-PackageFiles -PackageShare $Config.Paths.PackageShare -DestinationDir $WorkingDir
+        
+        # Extract application
+        $appPath = Expand-Application -WorkingDir $WorkingDir
+        
+        # Install license file
+        $workingAppDir = Install-LicenseFile -WorkingDir $WorkingDir -AppPath $appPath -SubFolder $Config.Application.WorkingSubfolder
+        
+        # Prepare for application execution
+        $executablePath = Join-Path $workingAppDir $Config.Application.ExecutableName
+        $fileNameBase = $Config.OutputFiles.FileNamePattern -f $Hostname, $CurrentDate
+        $expectedLogFile = Join-Path $workingAppDir "$fileNameBase.txt"
+        
+        Write-Log "Expected output file pattern: $fileNameBase.{extension}"
+        Write-Log "Expected log file for monitoring: $expectedLogFile"
+        
+        # Execute application
+        $exitCode = Invoke-Application -ExecutablePath $executablePath -Arguments $Config.Application.ExecutableArgs -WorkingDir $workingAppDir -LogFilePath $expectedLogFile -TimeoutMinutes $Config.Application.TimeoutMinutes
+        
+        # Collect output files
+        $outputFiles = Get-OutputFiles -SearchPath $workingAppDir -FileNameBase $fileNameBase -Extensions $Config.OutputFiles.Extensions
+        
+        if ($outputFiles.Count -eq 0) {
+            throw "No output files were generated by the application"
+        }
+        
+        # Create and publish results
+        $archiveName = "Results_$Hostname`_$CurrentDate.7z"
+        Publish-Results -OutputFiles $outputFiles -WorkingDir $WorkingDir -ResultsShare $Config.Paths.ResultsShare -ArchiveName $archiveName
+        
+        Write-Log "=== Deployment completed successfully ==="
+        return 0
+        
+    }
+    catch {
+        Write-Log "Deployment failed: $($_.Exception.Message)" -Level "Error"
+        if ($_.ScriptStackTrace) {
+            Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level "Error"
+        }
+        return 1
+    }
+    finally {
+        # Always cleanup
+        Cleanup
+    }
+}
+
+# Execute main function
+$exitCode = Main
+Write-Host "Deployment finished with exit code: $exitCode"
+exit $exitCode
