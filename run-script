@@ -1,0 +1,47 @@
+# Server-Setup-Shares.ps1 - Run on server
+param(
+    [string]$ShareBasePath = "C:\DeploymentShare"
+)
+
+# Create directories
+$PackagePath = Join-Path $ShareBasePath "Packages"
+$ResultsPath = Join-Path $ShareBasePath "Results"
+
+Write-Host "Creating deployment share directories..."
+New-Item -Path $PackagePath -ItemType Directory -Force | Out-Null
+New-Item -Path $ResultsPath -ItemType Directory -Force | Out-Null
+
+# Create hidden share for packages (read-only for clients)
+Write-Host "Creating package share (hidden)..."
+New-SmbShare -Name "DeployPackages$" -Path $PackagePath -ReadAccess "Domain Computers", "Everyone" -FullAccess "Administrators" -Description "Deployment Packages (Hidden)"
+
+# Create hidden share for results (write-only for clients, no read access)
+Write-Host "Creating results share (hidden, write-only)..."
+New-SmbShare -Name "DeployResults$" -Path $ResultsPath -FullAccess "Administrators" -Description "Deployment Results (Hidden)"
+
+# Set NTFS permissions
+Write-Host "Setting NTFS permissions..."
+
+# Package folder: Read access for everyone
+icacls $PackagePath /inheritance:r
+icacls $PackagePath /grant "Administrators:(OI)(CI)F"
+icacls $PackagePath /grant "Everyone:(OI)(CI)R"
+
+# Results folder: Write/Create access only, no read/list access for regular users
+icacls $ResultsPath /inheritance:r
+icacls $ResultsPath /grant "Administrators:(OI)(CI)F"
+icacls $ResultsPath /grant "Everyone:(CI)(W,AD,WD)"
+icacls $ResultsPath /deny "Everyone:(OI)(R,RD,RA)"
+
+# Set hidden attribute on share folders
+attrib +h $PackagePath
+attrib +h $ResultsPath
+
+Write-Host "Share setup completed successfully:"
+Write-Host "Package Share (Hidden): \\$env:COMPUTERNAME\DeployPackages$"
+Write-Host "Results Share (Hidden): \\$env:COMPUTERNAME\DeployResults$"
+Write-Host ""
+Write-Host "Security Notes:"
+Write-Host "- Package share: Read-only access for all users"
+Write-Host "- Results share: Write-only access, no read/list permissions for regular users"
+Write-Host "- Both shares are hidden ($ suffix)"
